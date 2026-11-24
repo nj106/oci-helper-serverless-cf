@@ -2,7 +2,7 @@ name: Sync upstream and deploy
 
 on:
   schedule:
-    - cron: '0 20 * * *'   # 04:00 Beijing
+    - cron: '37 2 * * *'   # 10:37 Beijing (02:37 UTC, GitHub 低负载时段)
   workflow_dispatch:
 
 permissions:
