@@ -15,7 +15,7 @@
 
 1. 点击页面顶部的 **Deploy to Cloudflare** 按钮。
 2. 授权 GitHub / Cloudflare，Cloudflare 会把本仓库**复制一份到你自己的 GitHub 账号**，并自动创建 D1 数据库、绑定资源、完成部署（按向导提示填写 Worker 名称即可，默认 `oci-helper-serverless`）。
-3. 部署完成后打开 Worker 域名（如 `https://oci-helper-serverless.<你的子域>.workers.dev`），用默认密码 `admin123` 登录。
+3. 部署完成后，先在 Worker → **设置 → 变量与 Secrets** 设置 `AUTH_PASSWORD` 和 `KEY_SECRET`（见下方“部署后必做”），再打开 Worker 域名（如 `https://oci-helper-serverless.<你的子域>.workers.dev`）登录。若未设置 `AUTH_PASSWORD`，Worker 会在日志中输出一个随机初始密码，请用该密码登录。
 
 > 这个方式会 Fork 仓库到你的账号（Cloudflare 的机制如此，无法关闭），好处是以后可以在你 Fork 的仓库点 **Sync fork** 同步源仓库更新，Cloudflare 会自动重新部署。
 
@@ -34,7 +34,7 @@
    （`wrangler.import.toml` 是专门为不 Fork 方式准备的配置，不声明 D1，因此不会因占位符 `database_id` 而部署失败。）
 3. **绑定 D1**：部署完成后，进入该 Worker → **设置 → 绑定 → 添加绑定**，类型选 **D1 数据库**，**变量名称必须填 `DB`**（大小写一致），选择第 1 步创建的数据库，保存。
 4. **重新部署**：在 Worker 的 **部署** 页点一次重新部署，让绑定生效。Worker 首次请求时会自动建表，无需执行任何 SQL 命令。
-5. 打开 Worker 域名，用默认密码 `admin123` 登录。
+5. 设置 `AUTH_PASSWORD` 和 `KEY_SECRET` 后打开 Worker 域名登录；未设置 `AUTH_PASSWORD` 时请查看 Worker 日志中的随机初始密码。
 
 > 为何方式二不能自动建库：Cloudflare 的"连接 GitHub 导入仓库"流程不会读取占位符自动创建 D1，只有 Deploy 按钮的向导才会。因此这里用 `wrangler.import.toml` 跳过 D1 声明，再在 Dashboard 里手动绑定（变量名 `DB`）。数据库名称本身随便，Worker 只认绑定变量名 `DB`。
 
@@ -60,14 +60,14 @@ wrangler deploy
 
 ## 部署后必做（安全🔒）
 
-登录后请尽快：
+首次使用必须配置以下变量（未设置 `KEY_SECRET` 时所有 API 将返回 503，不会以固定常量加密敏感数据）：
 1. 在 Cloudflare 控制台 → Workers & Pages → 你的 Worker → **Settings → Variables and Secrets** 添加：
-   - `AUTH_PASSWORD`：你的登录密码（替换默认 `admin123`）
-   - `AUTH_SECRET`：一串随机长字符串（用于签名登录 token）
-   - `KEY_SECRET`：另一串随机长字符串（用于加密 OCI 私钥；**修改后已录入的私钥需重新添加**）
+   - `AUTH_PASSWORD`：你的登录密码。未设置时 Worker 会生成随机初始密码并输出到日志；**修改该变量会使已签发 token 立即失效**。
+   - `AUTH_SECRET`：一串随机长字符串（仅用于签名登录 token，与加密密钥相互独立）。
+   - `KEY_SECRET`：另一串随机长字符串（**必填**，用于 HKDF 派生 AES-GCM 密钥加密 OCI 私钥、私钥口令、root 密码及系统密钥；**修改后已录入的敏感配置需重新添加**）。
 2. 在「系统设置」页填写 Telegram Bot Token / Chat ID（可选，用于通知）。
 
-> 提示：默认密码 `admin123` 仅用于首次登录演示，公网部署后务必修改。
+> 提示：本项目没有默认口令。若未设置 `AUTH_PASSWORD`，请从 Worker 日志获取随机初始密码并尽快改为自己的密码。
 
 ## 需要哪些API权限
 在 OCI 控制台创建一个 IAM 用户 + API Key，把 user OCID / tenancy OCID / fingerprint / 私钥填到系统设置。建议给该用户单独的组，策略最小化，例如：
@@ -89,4 +89,4 @@ Allow group <你的组> to inspect limits in tenancy
 
 ## 隐私与数据
 
-- 所有 OCI 私钥用 `KEY_SECRET` 派生的 AES-256-GCM 加密后存在**你自己的 D1 数据库**，本项目不收集任何数据。
+- OCI 私钥、私钥口令、任务 root 密码及系统密钥均用 `KEY_SECRET` 经 HKDF-SHA256 派生的 AES-256-GCM 加密后存在**你自己的 D1 数据库**，本项目不收集任何数据；缺少 `KEY_SECRET` 时拒绝服务与写入。登录 token 含 `jti` 与口令版本，改密即失效。

@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS task (
   os_version          TEXT,
   image_id            TEXT,
   subnet_id           TEXT,
-  root_password       TEXT,
+  root_password       TEXT,                -- AES-GCM 加密（KEY_SECRET），与私钥加密方式一致
   ssh_public_key      TEXT,                -- 与 root_password 二选一
   target_count        INTEGER NOT NULL DEFAULT 1,
   success_count       INTEGER NOT NULL DEFAULT 0,

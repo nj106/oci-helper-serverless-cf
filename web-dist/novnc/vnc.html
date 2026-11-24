@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Cloud Shell · noVNC</title>
+    <style>
+        html, body { height: 100%; margin: 0; background: #0b1120; color: #e2e8f0; font-family: system-ui, sans-serif; }
+        body { display: flex; flex-direction: column; }
+        #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 12px; background: #111a2e; border-bottom: 1px solid #1e293b; font-size: 13px; }
+        #status { flex: 1 1 140px; min-width: 120px; }
+        #bar button { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+        #bar button:hover { background: #334155; }
+        #bar button:disabled { opacity: .5; cursor: default; }
+        #bar button.active { background: #b91c1c; border-color: #dc2626; color: #fee2e2; }
+        #bar select { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 4px; font-size: 12px; }
+        #screen { flex: 1; overflow: hidden; background: #000; touch-action: none; }
+        #error { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 24px; color: #fca5a5; font-size: 14px; }
+        #paste-box { position: absolute; right: 12px; top: 52px; display: none; width: min(380px, calc(100vw - 24px)); background: #111a2e; border: 1px solid #334155; border-radius: 8px; padding: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5); box-sizing: border-box; }
+        #paste-box h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; color: #cbd5e1; }
+        #paste-box textarea { width: 100%; height: 84px; resize: vertical; background: #0b1120; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 8px; font: 12px/1.4 ui-monospace, monospace; box-sizing: border-box; }
+        #paste-preview { margin-top: 8px; padding: 6px 8px; background: #0b1120; border: 1px solid #1e293b; border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; color: #93c5fd; word-break: break-all; max-height: 88px; overflow: auto; white-space: pre-wrap; }
+        #paste-meta { margin-top: 6px; font-size: 11px; color: #94a3b8; }
+        #quick { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+        #quick button { background: #1e293b; color: #bae6fd; border: 1px solid #0ea5e9; border-radius: 999px; padding: 4px 10px; cursor: pointer; font-size: 11px; }
+        #quick button:hover { background: #0c4a6e; }
+        #quick-hint { display: none; margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; background: #422006; border: 1px solid #a16207; color: #fcd34d; font-size: 11px; line-height: 1.5; }
+        #paste-box .row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+        #paste-box .row button { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+        #paste-box .row button.primary { background: #0369a1; border-color: #0284c7; }
+
+        /* 窄屏 / 手机适配 */
+        @media (max-width: 640px) {
+            #bar { gap: 8px; padding: 8px; }
+            #status { flex: 1 1 100%; order: -1; }
+            #bar button { flex: 1 1 auto; padding: 10px 8px; font-size: 13px; }
+            #paste-box { position: fixed; left: 8px; right: 8px; top: 92px; width: auto; max-height: 72vh; overflow: auto; }
+            #paste-box textarea { height: 72px; font-size: 14px; }
+            #paste-box .row button { flex: 1 1 auto; padding: 10px 8px; font-size: 13px; }
+            #paste-preview { max-height: 64px; font-size: 13px; }
+        }
+    </style>
+    <script type="module" crossorigin="anonymous">
+        import RFB from './core/rfb.js';
+
+        const $ = (id) => document.getElementById(id);
+        const status = (t) => { $('status').textContent = t; };
+        const showError = (t) => { $('error').textContent = t; $('error').style.display = 'flex'; };
+        window.addEventListener('error', (e) => showError('JS 错误：' + (e.message || e.error)));
+        window.addEventListener('unhandledrejection', (e) => showError('未处理异常：' + (e.reason?.message ?? e.reason)));
+
+        function query(name, def) {
+            const m = location.href.match(new RegExp('.*[?&]' + name + '=([^&#]*)'));
+            return m ? decodeURIComponent(m[1]) : def;
+        }
+
+        /** 把文本转成可读预览：换行/Tab/不可发送字符都显式标出 */
+        function preview(text) {
+            let out = "";
+            for (const ch of text) {
+                if (ch === "\n") out += "⏎";
+                else if (ch === "\r") continue;
+                else if (ch === "\t") out += "⇥";
+                else if (ch === " ") out += "␣";
+                else {
+                    const code = ch.codePointAt(0);
+                    out += code > 0x7e ? `[U+${code.toString(16).toUpperCase()}]` : ch;
+                }
+            }
+            return out || "（空）";
+        }
+
+        const token = query('token', '');
+        if (!token) {
+            showError('缺少 VNC 令牌，请从实例列表重新点击「启动 VNC」。');
+        } else {
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const url = proto + '://' + location.host + '/api/vnc/ws?token=' + encodeURIComponent(token);
+            status('正在连接实例控制台…');
+
+            let rfb = null;
+
+            // 需要 Shift 的符号 -> 对应的基础键（US 键盘布局）
+            const SHIFT_MAP = {
+                "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8",
+                "(": "9", ")": "0", "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
+                ":": ";", '"': "'", "<": ",", ">": ".", "?": "/", "~": "`",
+            };
+            const SHIFT_KEYSYM = 0xffe1;
+            const RETURN_KEYSYM = 0xff0d;
+            const TAB_KEYSYM = 0xff09;
+            // 字符间留间隔：OCI console 是串口转发，瞬发大量按键会丢字符
+            const CHAR_DELAY_MS = 45;
+
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            /**
+             * 逐字符模拟真实键盘输入（含 Shift 组合与字符间隔）。
+             * console（tty）场景下标准 VNC 剪贴板同步无效，只能靠键盘事件。
+             */
+            async function typeText(text, enter, onProgress) {
+                if (!rfb) return { sent: 0, skipped: 0 };
+                // 先算出总步数，便于显示进度
+                let total = 0;
+                for (const ch of text) {
+                    if (ch === "\r") continue;
+                    const code = ch.codePointAt(0);
+                    if (ch !== "\n" && ch !== "\t" && code > 0x7e) continue;
+                    total += 1;
+                }
+                if (enter) total += 1;
+
+                let sent = 0;
+                let skipped = 0;
+                for (const ch of text) {
+                    if (ch === "\r") continue;
+                    if (ch === "\n") {
+                        rfb.sendKey(RETURN_KEYSYM, "Enter");
+                    } else if (ch === "\t") {
+                        rfb.sendKey(TAB_KEYSYM, "Tab");
+                    } else if (/[A-Z]/.test(ch)) {
+                        // 大写字母：Shift + 小写字母，兼容只认物理按键的控制台
+                        rfb.sendKey(SHIFT_KEYSYM, "ShiftLeft", true);
+                        rfb.sendKey(ch.toLowerCase().codePointAt(0), "");
+                        rfb.sendKey(SHIFT_KEYSYM, "ShiftLeft", false);
+                    } else if (SHIFT_MAP[ch]) {
+                        rfb.sendKey(SHIFT_KEYSYM, "ShiftLeft", true);
+                        rfb.sendKey(SHIFT_MAP[ch].codePointAt(0), "");
+                        rfb.sendKey(SHIFT_KEYSYM, "ShiftLeft", false);
+                    } else {
+                        const keysym = ch.codePointAt(0);
+                        if (keysym > 0x7e) { skipped += 1; continue; }
+                        rfb.sendKey(keysym, "");
+                    }
+                    sent += 1;
+                    onProgress?.(sent, total);
+                    await sleep(CHAR_DELAY_MS);
+                }
+                if (enter) {
+                    rfb.sendKey(RETURN_KEYSYM, "Enter");
+                    sent += 1;
+                    onProgress?.(sent, total);
+                }
+                return { sent, skipped };
+            }
+
+            function updatePreview() {
+                const text = $("paste-input").value;
+                let total = 0;
+                let unsupported = 0;
+                for (const ch of text) {
+                    if (ch === "\r") continue;
+                    total += 1;
+                    const code = ch.codePointAt(0);
+                    if (ch !== "\n" && ch !== "\t" && code > 0x7e) unsupported += 1;
+                }
+                $("paste-preview").textContent = preview(text);
+                const extra = unsupported ? `，其中 ${unsupported} 个字符无法发送（非 ASCII）` : "";
+                $("paste-meta").textContent = `共 ${total} 个字符${extra}。⏎=回车 ⇥=Tab ␣=空格`;
+            }
+
+            let sending = false;
+
+            async function doSend(enter) {
+                if (sending) return;
+                const text = $("paste-input").value;
+                $("paste-box").style.display = "none";
+                sending = true;
+                $("paste").disabled = true;
+                status("正在发送…");
+                try {
+                    const { sent, skipped } = await typeText(text, enter, (i, total) => {
+                        status(`正在发送 ${i}/${total}…`);
+                    });
+                    const tail = skipped ? `（跳过 ${skipped} 个不支持字符）` : "";
+                    status(`发送完成：共 ${sent} 个字符${enter ? "（含回车）" : ""}${tail}`);
+                } finally {
+                    sending = false;
+                    $("paste").disabled = false;
+                }
+            }
+
+            try {
+                // 手动建 WebSocket，以便在失败时拿到关闭码与原因（RFB 内部建的话拿不到）
+                const ws = new WebSocket(url);
+                ws.binaryType = "arraybuffer";
+                let everConnected = false;
+                ws.addEventListener("close", (e) => {
+                    const detail = `code=${e.code}${e.reason ? " · " + e.reason : ""}`;
+                    if (everConnected) {
+                        status("已断开：" + detail);
+                    } else {
+                        showError(
+                            e.code === 1006
+                                ? "连接失败（令牌可能已过期，请重新从实例列表点击「启动 VNC」）"
+                                : "连接失败：" + detail
+                        );
+                        status("连接失败：" + detail);
+                    }
+                });
+
+                rfb = new RFB($("screen"), ws, { credentials: {} });
+                rfb.addEventListener("connect", () => { everConnected = true; status("已连接"); });
+                rfb.addEventListener("disconnect", (e) => status(e.detail.clean ? "已断开" : "连接异常中断"));
+                rfb.addEventListener("desktopname", (e) => status("已连接 · " + e.detail.name));
+                rfb.addEventListener("credentialsrequired", () => {
+                    const password = prompt("该控制台需要 VNC 密码：");
+                    if (password) rfb.sendCredentials({ password });
+                });
+                rfb.viewOnly = false;
+                rfb.scaleViewport = true;
+
+                $("cad").onclick = () => rfb.sendCtrlAltDel();
+                $("reconnect").onclick = () => location.reload();
+                $("fullscreen").onclick = () => {
+                    if (document.fullscreenElement) document.exitFullscreen?.();
+                    else document.documentElement.requestFullscreen?.();
+                };
+
+                // 连按按键：OCI 的 VNC 有输入延迟，手动抢时机很难命中。
+                // 但 ESC 在 BIOS 里是「退出」，按多了会把刚进的设置界面退出去，
+                // 因此时长控制在 10 秒、间隔 250ms，并支持切换 F2/Del。
+                const SPAM_KEYS = {
+                    esc: { keysym: 0xff1b, code: "Escape", label: "ESC" },
+                    f2: { keysym: 0xffbf, code: "F2", label: "F2" },
+                    del: { keysym: 0xffff, code: "Delete", label: "Del" },
+                };
+                const SPAM_DURATION_MS = 10000;
+                const SPAM_INTERVAL_MS = 250;
+                let spamTimer = null;
+                let spamEndsAt = 0;
+
+                function currentSpamKey() {
+                    return SPAM_KEYS[$("spam-key").value] ?? SPAM_KEYS.esc;
+                }
+
+                function resetSpamButton() {
+                    const btn = $("spam");
+                    btn.textContent = "连按 " + currentSpamKey().label;
+                    btn.classList.remove("active");
+                }
+
+                function stopSpam(msg) {
+                    if (spamTimer) { clearTimeout(spamTimer); spamTimer = null; }
+                    resetSpamButton();
+                    if (msg) status(msg);
+                }
+
+                function startSpam() {
+                    stopSpam();
+                    const key = currentSpamKey();
+                    spamEndsAt = Date.now() + SPAM_DURATION_MS;
+                    $("spam").classList.add("active");
+                    const tick = () => {
+                        if (!rfb || Date.now() >= spamEndsAt) {
+                            stopSpam(`连按 ${key.label} 已结束`);
+                            return;
+                        }
+                        rfb.sendKey(key.keysym, key.code);
+                        const left = Math.ceil((spamEndsAt - Date.now()) / 1000);
+                        $("spam").textContent = `停止（${left}s）`;
+                        status(`正在连按 ${key.label}… 进入 BIOS 后请立即点「停止」`);
+                        spamTimer = setTimeout(tick, SPAM_INTERVAL_MS);
+                    };
+                    tick();
+                }
+
+                $("spam").onclick = () => {
+                    if (spamTimer) stopSpam("已停止连按");
+                    else startSpam();
+                };
+                $("spam-key").onchange = () => { if (!spamTimer) resetSpamButton(); };
+
+                // 打开粘贴面板：先尝试读剪贴板填入，然后让用户确认内容再发送
+                $("paste").onclick = async () => {
+                    $("paste-box").style.display = "block";
+                    $("quick-hint").style.display = "none";
+                    try {
+                        const text = await navigator.clipboard.readText();
+                        // 仅在输入框为空时用剪贴板填充，避免覆盖用户已输入的内容
+                        if (text && !$("paste-input").value) $("paste-input").value = text;
+                    } catch {
+                        // 移动端/未授权时会读取失败，用户可在输入框手动粘贴
+                    }
+                    updatePreview();
+                    $("paste-input").focus();
+                    $("paste-input").select();
+                };
+
+                // 快捷指令：重启并直接进入固件设置（无需抢按键）
+                $("q-firmware").onclick = () => {
+                    $("paste-input").value = "sudo systemctl reboot --firmware-setup";
+                    updatePreview();
+                    const hint = $("quick-hint");
+                    hint.textContent =
+                        "该命令会让实例重启并直接进入 BIOS/UEFI 设置界面，不需要抢按 ESC/F2。" +
+                        "若 sudo 需要密码，请先单独输入密码再执行本命令。";
+                    hint.style.display = "block";
+                    $("paste-input").focus();
+                };
+
+                $("paste-input").oninput = updatePreview;
+                $("paste-send").onclick = () => doSend(false);
+                $("paste-send-enter").onclick = () => doSend(true);
+                $("paste-cancel").onclick = () => { $("paste-box").style.display = "none"; };
+            } catch (e) {
+                showError("连接失败：" + (e?.message ?? e));
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="bar">
+        <span id="status">Loading</span>
+        <select id="spam-key" title="选择要连按的按键（ESC 在 BIOS 内是退出，可改用 F2）">
+            <option value="esc">ESC</option>
+            <option value="f2">F2</option>
+            <option value="del">Del</option>
+        </select>
+        <button id="spam" title="重启后自动连按所选按键，用于进入 BIOS/启动菜单">连按 ESC</button>
+        <button id="paste">输入/粘贴</button>
+        <button id="cad">Ctrl+Alt+Del</button>
+        <button id="fullscreen">全屏</button>
+        <button id="reconnect">重连</button>
+    </div>
+    <div id="screen"></div>
+    <div id="error"></div>
+    <div id="paste-box">
+        <h3>发送内容（手机端可在此直接输入）</h3>
+        <div id="quick">
+            <button type="button" id="q-firmware" title="重启并直接进入 BIOS/UEFI 设置界面">⚡ 重启进 BIOS</button>
+        </div>
+        <div id="quick-hint"></div>
+        <textarea id="paste-input" placeholder="在此粘贴或输入要发送的文本"
+                  autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false"></textarea>
+        <div id="paste-preview"></div>
+        <div id="paste-meta"></div>
+        <div class="row">
+            <button id="paste-cancel">取消</button>
+            <button id="paste-send">仅发送</button>
+            <button id="paste-send-enter" class="primary">发送并回车</button>
+        </div>
+    </div>
+</body>
+</html>
