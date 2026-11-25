@@ -14,8 +14,8 @@
 ## 方式一：一键按钮部署（自动创建 D1）（推荐🏆）
 
 1. 点击页面顶部的 **Deploy to Cloudflare** 按钮。
-2. 授权 GitHub / Cloudflare，Cloudflare 会把本仓库**复制一份到你自己的 GitHub 账号**，并自动创建 D1 数据库、绑定资源、完成部署（按向导提示填写 Worker 名称即可，默认 `oci-helper-serverless`）。
-3. 部署完成后，先在 Worker → **设置 → 变量与 Secrets** 设置 `AUTH_PASSWORD` 和 `KEY_SECRET`（见下方“部署后必做”），再打开 Worker 域名（如 `https://oci-helper-serverless.<你的子域>.workers.dev`）登录。若未设置 `AUTH_PASSWORD`，Worker 会在日志中输出一个随机初始密码，请用该密码登录。
+2. 授权 GitHub / Cloudflare，Cloudflare 会把本仓库**复制一份到你自己的 GitHub 账号**，并自动创建 D1 数据库（如未创建，参考下方方式二创建并绑定）、绑定资源、完成部署（按向导提示填写 Worker 名称即可，默认 `oci-helper-serverless`）。
+3. 部署完成后，先在 Worker → **设置 → 变量与 Secrets** 设置 `AUTH_PASSWORD`、 `AUTH_SECRET` 和 `KEY_SECRET`（见下方“部署后必做”），再打开 Worker 域名（如 `https://oci-helper-serverless.<你的子域>.workers.dev`）登录。
 
 > 这个方式会 Fork 仓库到你的账号（Cloudflare 的机制如此，无法关闭），好处是以后可以在你 Fork 的仓库点 **Sync fork** 同步源仓库更新，Cloudflare 会自动重新部署。
 
@@ -68,6 +68,9 @@ wrangler deploy
 2. 在「系统设置」页填写 Telegram Bot Token / Chat ID（可选，用于通知）。
 
 > 提示：本项目没有默认口令。若未设置 `AUTH_PASSWORD`，请从 Worker 日志获取随机初始密码并尽快改为自己的密码。
+
+<img width="934" height="442" alt="image" src="https://github.com/user-attachments/assets/a9decfd4-fee5-4b8d-a1f6-2d50507f6510" />
+
 
 ## 需要哪些API权限
 在 OCI 控制台创建一个 IAM 用户 + API Key，把 user OCID / tenancy OCID / fingerprint / 私钥填到系统设置。建议给该用户单独的组，策略最小化，例如：

@@ -200021,21 +200021,55 @@ function toBase64Url2(bytes) {
   return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 __name(toBase64Url2, "toBase64Url");
+function mpint(bytes) {
+  let start = 0;
+  while (start < bytes.length - 1 && bytes[start] === 0) start++;
+  let slice = bytes.slice(start);
+  if (slice[0] & 128) {
+    const out2 = new Uint8Array(slice.length + 1);
+    out2.set(slice, 1);
+    slice = out2;
+  }
+  const out = new Uint8Array(4 + slice.length);
+  new DataView(out.buffer).setUint32(0, slice.length);
+  out.set(slice, 4);
+  return out;
+}
+__name(mpint, "mpint");
 async function generateVncKeyPair() {
+  const nodeCrypto = (await import("node:crypto")).default;
   const { utils: ssh2Utils } = await Promise.resolve().then(() => __toESM(require_lib2(), 1));
   for (let attempt = 0; attempt < 3; attempt++) {
-    const pair = ssh2Utils.generateKeyPairSync("rsa", { bits: 2048 });
-    const publicParsed = ssh2Utils.parseKey(Buffer.from(pair.public));
-    const privateParsed = ssh2Utils.parseKey(Buffer.from(pair.private));
-    if (!publicParsed || !privateParsed) continue;
-    const pubBlob = Buffer.from(publicParsed.getPublicSSH());
-    const derivedBlob = Buffer.from(privateParsed.getPublicSSH());
-    if (!pubBlob.length || !derivedBlob.length || !pubBlob.equals(derivedBlob)) continue;
-    return {
-      // getPublicSSH() 是二进制 blob（含 ssh-rsa 算法名），需自行 base64 化为 OpenSSH 单行格式
-      publicKeyOpenSSH: `ssh-rsa ${pubBlob.toString("base64")} oci-helper-vnc`,
-      privateKeyPem: privateParsed.getPrivatePEM().toString()
-    };
+    const { publicKey, privateKey } = nodeCrypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const jwk = publicKey.export({ format: "jwk" });
+    if (!jwk.n || !jwk.e) continue;
+    const e = base64UrlToBytes(jwk.e);
+    const n = base64UrlToBytes(jwk.n);
+    const alg = new TextEncoder().encode("ssh-rsa");
+    const algLen = new Uint8Array(4);
+    new DataView(algLen.buffer).setUint32(0, alg.length);
+    const eMp = mpint(e);
+    const nMp = mpint(n);
+    const body = new Uint8Array(algLen.length + alg.length + eMp.length + nMp.length);
+    let off = 0;
+    body.set(algLen, off);
+    off += algLen.length;
+    body.set(alg, off);
+    off += alg.length;
+    body.set(eMp, off);
+    off += eMp.length;
+    body.set(nMp, off);
+    const publicKeyOpenSSH = `ssh-rsa ${bytesToBase64(body)} oci-helper-vnc`;
+    const privateKeyPem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    try {
+      const parsed = ssh2Utils.parseKey(privateKeyPem);
+      if (!parsed || parsed instanceof Error) continue;
+      const derived = Buffer.from(parsed.getPublicSSH());
+      if (!derived.equals(Buffer.from(body))) continue;
+    } catch {
+      continue;
+    }
+    return { publicKeyOpenSSH, privateKeyPem };
   }
   throw new Error("\u751F\u6210\u914D\u5BF9\u7684 SSH \u5BC6\u94A5\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5");
 }
@@ -200068,81 +200102,129 @@ async function createConsoleConnection(clients, instanceId, publicKeyOpenSSH) {
     const s = String(state ?? "");
     return s === "DELETED" || s === "TERMINATED";
   }, "isGone");
-  async function listExisting() {
-    const found = /* @__PURE__ */ new Map();
-    for (const compartmentId of [...new Set(compartmentCandidates)]) {
-      try {
-        const res = await clients.compute.listInstanceConsoleConnections({ compartmentId, instanceId });
-        for (const x of res.items ?? []) {
-          if (x.id) found.set(x.id, { id: x.id, state: String(x.lifecycleState ?? "") });
-        }
-      } catch {
-      }
+  const listIn = /* @__PURE__ */ __name(async (compartmentId) => {
+    try {
+      const res = await clients.compute.listInstanceConsoleConnections({ compartmentId, instanceId });
+      return (res.items ?? []).filter((x) => !!x.id).map((x) => ({ id: x.id, state: String(x.lifecycleState ?? "") }));
+    } catch {
+      return [];
     }
-    return [...found.values()];
+  }, "listIn");
+  async function listExisting() {
+    const primary = compartmentCandidates[0];
+    if (primary) {
+      const items = await listIn(primary);
+      if (items.length) return items;
+    }
+    const fallback = compartmentCandidates.find((x) => x !== primary);
+    return fallback ? listIn(fallback) : [];
   }
   __name(listExisting, "listExisting");
-  for (let round = 0; round < 20; round++) {
-    const list = await listExisting();
-    console.log(`[VNC] conn states: ${list.map((x) => `${x.id.slice(-8)}=${x.state}`).join(", ")}`);
-    const busy2 = list.filter((x) => !isGone(x.state));
-    if (!busy2.length) break;
-    for (const conn of busy2) {
-      try {
-        await clients.compute.deleteInstanceConsoleConnection({ instanceConsoleConnectionId: conn.id });
-      } catch {
-      }
-    }
-    await new Promise((r) => setTimeout(r, 3e3));
-  }
-  const busy = (await listExisting()).filter((x) => !isGone(x.state));
-  if (busy.length) {
-    throw new Error(`\u65E7 Console Connection \u4ECD\u5728\u5220\u9664\u4E2D\uFF08${busy.map((x) => x.state).join(",")}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u518D\u8BD5`);
-  }
-  const resp = await clients.compute.createInstanceConsoleConnection({
-    createInstanceConsoleConnectionDetails: { instanceId, publicKey: publicKeyOpenSSH }
-  });
-  const connectionId = resp.instanceConsoleConnection?.id ?? "";
-  if (!connectionId) throw new Error("\u521B\u5EFA Console Connection \u5931\u8D25\uFF1A\u672A\u8FD4\u56DE ID");
-  for (let i = 0; i < 30; i++) {
-    const info = await clients.compute.getInstanceConsoleConnection({
-      instanceConsoleConnectionId: connectionId
+  const createOnce = /* @__PURE__ */ __name(async () => {
+    const resp = await clients.compute.createInstanceConsoleConnection({
+      createInstanceConsoleConnectionDetails: { instanceId, publicKey: publicKeyOpenSSH }
     });
-    const conn = info.instanceConsoleConnection;
-    const str = conn?.vncConnectionString;
-    if (str) {
-      let matched = false;
-      try {
-        matched = parseVncConnectionString(str).connectionOcid === connectionId;
-      } catch {
-        matched = false;
-      }
-      if (matched) {
-        if (String(conn.lifecycleState ?? "") === "CREATING") {
-          await new Promise((r) => setTimeout(r, 6e3));
+    const connectionId = resp.instanceConsoleConnection?.id ?? "";
+    if (!connectionId) throw new Error("\u521B\u5EFA Console Connection \u5931\u8D25\uFF1A\u672A\u8FD4\u56DE ID");
+    for (let i = 0; i < 20; i++) {
+      const info = await clients.compute.getInstanceConsoleConnection({
+        instanceConsoleConnectionId: connectionId
+      });
+      const conn = info.instanceConsoleConnection;
+      const str = conn?.vncConnectionString;
+      if (str) {
+        let matched = false;
+        try {
+          matched = parseVncConnectionString(str).connectionOcid === connectionId;
+        } catch {
+          matched = false;
         }
-        return {
-          connectionId,
-          vncConnectionString: str,
-          fingerprint: conn?.fingerprint ?? void 0
-        };
+        if (matched) {
+          if (String(conn.lifecycleState ?? "") === "CREATING") {
+            await new Promise((r) => setTimeout(r, 6e3));
+          }
+          return { connectionId, vncConnectionString: str, fingerprint: conn?.fingerprint ?? void 0 };
+        }
+      }
+      if (String(conn?.lifecycleState ?? "") === "FAILED") {
+        throw new Error(
+          "OCI \u65E0\u6CD5\u4E3A\u8BE5\u5B9E\u4F8B\u5EFA\u7ACB\u63A7\u5236\u53F0\u901A\u9053\uFF08\u8FDE\u63A5\u72B6\u6001 FAILED\uFF09\u3002\u8FD9\u901A\u5E38\u8BF4\u660E\u5B9E\u4F8B\u4FA7\u7684\u63A7\u5236\u53F0\u670D\u52A1\u5F02\u5E38\u3002\u53EF\u5728\u300C\u63A7\u5236\u53F0\u8FDE\u63A5\u300D\u91CC\u5220\u6389\u8FD9\u6761\u8BB0\u5F55\uFF0C\u6216\u91CD\u542F\u5B9E\u4F8B\u540E\u518D\u8BD5"
+        );
+      }
+      await new Promise((r) => setTimeout(r, 3e3));
+    }
+    throw new Error("\u7B49\u5F85 Console Connection \u5C31\u7EEA\u8D85\u65F6\uFF08\u5DF2\u7B49 60 \u79D2\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF09");
+  }, "createOnce");
+  const errorText = /* @__PURE__ */ __name((e) => `${e?.statusCode ?? ""} ${e?.code ?? ""} ${e?.serviceError?.code ?? ""} ${e?.message ?? ""} ${e?.serviceError?.message ?? ""}`, "errorText");
+  const isInstanceBusy = /* @__PURE__ */ __name((e) => /is currently being modified|currently being modified/i.test(errorText(e)), "isInstanceBusy");
+  const is409 = /* @__PURE__ */ __name((e) => {
+    const text = errorText(e);
+    if (/is currently being modified/i.test(text)) return false;
+    return /409|already exists or has not been terminated/i.test(text);
+  }, "is409");
+  const instanceState = /* @__PURE__ */ __name(async () => {
+    try {
+      const res = await clients.compute.getInstance({ instanceId });
+      return String(res.instance?.lifecycleState ?? "UNKNOWN");
+    } catch (e) {
+      return `\u67E5\u8BE2\u5931\u8D25\uFF08${String(e?.message ?? e).slice(0, 80)}\uFF09`;
+    }
+  }, "instanceState");
+  const clearStaleConnections = /* @__PURE__ */ __name(async () => {
+    const primary = compartmentCandidates[0];
+    const pending = (await listExisting()).filter((x) => !isGone(x.state));
+    if (!pending.length) return "";
+    let deleteErr = "";
+    for (const c of pending) {
+      try {
+        await clients.compute.deleteInstanceConsoleConnection({ instanceConsoleConnectionId: c.id });
+      } catch (e) {
+        const msg = String(e?.message ?? e).slice(0, 120);
+        deleteErr = deleteErr || `${c.id.slice(-8)}(${c.state})\uFF1A${msg}`;
       }
     }
-    if (String(conn?.lifecycleState ?? "") === "FAILED") throw new Error("Console Connection \u521B\u5EFA\u5931\u8D25");
-    await new Promise((r) => setTimeout(r, 5e3));
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 3e3));
+      if (!(await listIn(primary)).some((x) => !isGone(x.state))) return deleteErr;
+    }
+    return deleteErr;
+  }, "clearStaleConnections");
+  const createWithRetry = /* @__PURE__ */ __name(async () => {
+    let lastErr = null;
+    const MAX = 3;
+    for (let attempt = 0; attempt < MAX; attempt++) {
+      try {
+        return await createOnce();
+      } catch (e) {
+        lastErr = e;
+        if (is409(e)) {
+          const deleteErr = await clearStaleConnections();
+          if (attempt < MAX - 1) {
+            await new Promise((r) => setTimeout(r, 3e3));
+            continue;
+          }
+          const state = await instanceState();
+          const conns = (await listExisting()).filter((x) => !isGone(x.state));
+          const detail = conns.length ? conns.map((x) => `${x.id.slice(-8)}=${x.state}`).join("\uFF0C") : "\u65E0";
+          const delHint = deleteErr ? `\uFF1B\u5220\u9664\u5931\u8D25\u539F\u56E0\uFF1A${deleteErr}` : "";
+          throw new Error(
+            `\u5B9E\u4F8B\u72B6\u6001 ${state}\uFF0C\u4F46 OCI \u4ECD\u62D2\u7EDD\u521B\u5EFA\u63A7\u5236\u53F0\u8FDE\u63A5\uFF08\u6B8B\u7559\u8FDE\u63A5\uFF1A${detail}${delHint}\uFF09\u3002\u8BF7\u5728 OCI \u63A7\u5236\u53F0 \u2192 \u5B9E\u4F8B \u2192 \u63A7\u5236\u53F0\u8FDE\u63A5 \u4E2D\u5220\u9664\u8BE5\u6B8B\u7559\u8FDE\u63A5\u540E\u91CD\u8BD5`
+          );
+        }
+        throw e;
+      }
+    }
+    throw new Error(`\u521B\u5EFA Console Connection \u5931\u8D25\uFF1A${lastErr?.message ?? lastErr}`);
+  }, "createWithRetry");
+  const created = await createWithRetry();
+  const ourFp = await sshFingerprint(publicKeyOpenSSH);
+  const ociFp = String(created.fingerprint ?? "").replace("SHA256:", "").replace(/=+$/, "");
+  if (ociFp && ourFp && ociFp !== ourFp) {
+    console.warn(`[VNC] \u516C\u94A5\u6307\u7EB9\u4E0D\u4E00\u81F4\uFF08OCI ${ociFp.slice(0, 16)} / \u6211\u65B9 ${ourFp.slice(0, 16)}\uFF09\uFF0C\u4FDD\u7559\u8FDE\u63A5\u4E0D\u5220\u9664`);
   }
-  throw new Error("\u7B49\u5F85 Console Connection \u5C31\u7EEA\u8D85\u65F6\uFF08\u5DF2\u7B49 150 \u79D2\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF09");
+  return created;
 }
 __name(createConsoleConnection, "createConsoleConnection");
-async function deleteConsoleConnection(clients, connectionId) {
-  try {
-    await clients.compute.deleteInstanceConsoleConnection({
-      instanceConsoleConnectionId: connectionId
-    });
-  } catch {
-  }
-}
-__name(deleteConsoleConnection, "deleteConsoleConnection");
 async function probeRelayAuth(session, timeoutMs = 2e4) {
   const { Client } = await Promise.resolve().then(() => __toESM(require_lib2(), 1));
   const conn = new Client();
@@ -203608,13 +203690,19 @@ app.post("/api/vnc/start", async (c) => {
     for (const row of rows.results ?? []) {
       try {
         const s = JSON.parse(await decryptText(keySecretsForRead(c.env), row.value));
-        if (s.instanceId !== instanceId || s.cfgId !== cfgId || s.expiresAt <= Date.now()) continue;
+        if (s.instanceId !== instanceId || s.cfgId !== cfgId) continue;
+        if (s.expiresAt <= Date.now() - 7 * 24 * 60 * 60 * 1e3) continue;
         if (!s.publicKeyOpenSSH) continue;
-        const info = await clients.compute.getInstanceConsoleConnection({
-          instanceConsoleConnectionId: s.connectionId
-        });
-        const st = String(info.instanceConsoleConnection?.lifecycleState ?? "");
-        if ((st === "ACTIVE" || st === "CREATING") && info.instanceConsoleConnection?.vncConnectionString) {
+        try {
+          const info = await clients.compute.getInstanceConsoleConnection({
+            instanceConsoleConnectionId: s.connectionId
+          });
+          const st = String(info.instanceConsoleConnection?.lifecycleState ?? "");
+          if ((st === "ACTIVE" || st === "CREATING" || st === "FAILED") && info.instanceConsoleConnection?.vncConnectionString) {
+            reused = { sessionId: row.key.slice(VNC_SESSION_PREFIX2.length), session: s };
+            break;
+          }
+        } catch {
           reused = { sessionId: row.key.slice(VNC_SESSION_PREFIX2.length), session: s };
           break;
         }
@@ -203663,47 +203751,26 @@ app.post("/api/vnc/start", async (c) => {
       session = built.s;
     }
     await saveSession(sessionId, session);
-    const isAuthFailure = /* @__PURE__ */ __name((msg) => /authentication methods failed|permission denied|no supported authentication/i.test(msg), "isAuthFailure");
     let warn = "";
     try {
       await probeRelayAuth(session);
     } catch (e) {
-      const msg = String(e?.message ?? e);
-      if (reused && isAuthFailure(msg)) {
-        await deleteConsoleConnection(clients, session.connectionId);
-        try {
-          await c.env.DB.prepare("DELETE FROM sys_cfg WHERE key = ?").bind(VNC_SESSION_PREFIX2 + sessionId).run();
-        } catch {
-        }
-        const built = await buildFresh();
-        sessionId = built.sid;
-        session = built.s;
-        await saveSession(sessionId, session);
-        try {
-          await probeRelayAuth(session);
-        } catch (e2) {
-          warn = String(e2?.message ?? e2);
-        }
-      } else {
-        warn = String(e?.message ?? e);
-      }
+      warn = String(e?.message ?? e);
     }
     const pruneStale = /* @__PURE__ */ __name(async () => {
       try {
         const all = await c.env.DB.prepare("SELECT key, value FROM sys_cfg WHERE key LIKE ?").bind(VNC_SESSION_PREFIX2 + "%").all();
         for (const row of all.results ?? []) {
           if (row.key === VNC_SESSION_PREFIX2 + sessionId) continue;
-          let old = null;
           let sameInstance = false;
           try {
-            old = JSON.parse(await decryptText(keySecretsForRead(c.env), row.value));
+            const old = JSON.parse(await decryptText(keySecretsForRead(c.env), row.value));
             sameInstance = old.instanceId === instanceId && old.cfgId === cfgId;
           } catch {
             await c.env.DB.prepare("DELETE FROM sys_cfg WHERE key = ?").bind(row.key).run();
             continue;
           }
           if (!sameInstance) continue;
-          if (old?.connectionId) await deleteConsoleConnection(clients, old.connectionId);
           await c.env.DB.prepare("DELETE FROM sys_cfg WHERE key = ?").bind(row.key).run();
         }
       } catch {
@@ -203715,7 +203782,117 @@ app.post("/api/vnc/start", async (c) => {
     c.executionCtx.waitUntil(pruneStale());
     return c.json({ token, ttl: VNC_TOKEN_TTL, warn: warn || void 0 });
   } catch (e) {
+    const msg = errorMessage(e);
+    if (/429|too many requests|toomanyrequests/i.test(msg)) {
+      return Response.json(
+        {
+          error: "OCI \u63A5\u53E3\u9650\u6D41\uFF08429 Too many requests\uFF09\uFF0C\u8BF7\u7B49 1~2 \u5206\u949F\u540E\u518D\u8BD5\u3002\n\u8FD9\u901A\u5E38\u662F\u77ED\u65F6\u95F4\u5185\u591A\u6B21\u521B\u5EFA/\u5220\u9664\u63A7\u5236\u53F0\u8FDE\u63A5\u89E6\u53D1\u7684\u79DF\u6237\u7EA7\u9650\u5236\u3002",
+          throttled: true
+        },
+        { status: 429 }
+      );
+    }
+    const needCleanup = /控制台连接|变更中|409|创建 Console Connection|残留连接/i.test(msg);
+    return Response.json(
+      {
+        error: needCleanup ? `${msg}
+\u53EF\u5728\u5B9E\u4F8B\u5361\u7247\u7684\u300C\u63A7\u5236\u53F0\u8FDE\u63A5\u300D\u4E2D\u5220\u9664\u6B8B\u7559\u8FDE\u63A5\u540E\u91CD\u8BD5` : msg,
+        needConsoleCleanup: needCleanup
+      },
+      { status: 400 }
+    );
+  }
+});
+app.post("/api/vnc/attach", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const cfgId = (body.cfgId ?? "").trim();
+  const connectionId = (body.connectionId ?? "").trim();
+  if (!cfgId || !connectionId) return badRequest("\u7F3A\u5C11\u914D\u7F6E ID \u6216\u8FDE\u63A5 ID");
+  try {
+    const rows = await c.env.DB.prepare("SELECT key, value FROM sys_cfg WHERE key LIKE ?").bind(VNC_SESSION_PREFIX2 + "%").all();
+    for (const row of rows.results ?? []) {
+      let s = null;
+      try {
+        s = JSON.parse(await decryptText(keySecretsForRead(c.env), row.value));
+      } catch {
+        continue;
+      }
+      if (!s || s.connectionId !== connectionId || s.cfgId !== cfgId) continue;
+      const next = { ...s, expiresAt: Date.now() + VNC_SESSION_TTL };
+      await c.env.DB.prepare("UPDATE sys_cfg SET value = ?, updated_at = ? WHERE key = ?").bind(await encryptText(keySecret(c.env), JSON.stringify(next)), nowIso2(), row.key).run();
+      const token = await signVncToken(
+        await authSecret(c.env),
+        row.key.slice(VNC_SESSION_PREFIX2.length),
+        Date.now() + VNC_TOKEN_TTL
+      );
+      return c.json({ token, ttl: VNC_TOKEN_TTL });
+    }
+    return Response.json(
+      { error: "\u672C\u5730\u6CA1\u6709\u8FD9\u6761\u8FDE\u63A5\u7684\u79C1\u94A5\uFF08\u53EF\u80FD\u5728\u5386\u53F2\u5931\u8D25\u6E05\u7406\u4E2D\u4E22\u5931\uFF09\uFF0C\u65E0\u6CD5\u76F4\u63A5\u8FDE\u63A5" },
+      { status: 400 }
+    );
+  } catch (e) {
     return Response.json({ error: errorMessage(e) }, { status: 400 });
+  }
+});
+app.get("/api/vnc/console-connections", async (c) => {
+  const cfgId = (c.req.query("cfgId") ?? "").trim();
+  const instanceId = (c.req.query("instanceId") ?? "").trim();
+  if (!cfgId || !instanceId) return badRequest("\u7F3A\u5C11\u914D\u7F6E ID \u6216\u5B9E\u4F8B ID");
+  const cfg = await getCfg2(c.env, cfgId);
+  if (!cfg) return badRequest("OCI \u914D\u7F6E\u4E0D\u5B58\u5728");
+  const region = (c.req.query("region") ?? "").trim() || void 0;
+  const compartment = (c.req.query("compartment") ?? "").trim() || void 0;
+  try {
+    const clients = await clientsFor(c.env, cfg, region, compartment);
+    let compartmentId = compartment || cfg.compartment_id || cfg.tenancy_ocid;
+    let instanceState = "";
+    try {
+      const inst = await clients.compute.getInstance({ instanceId });
+      instanceState = String(inst.instance?.lifecycleState ?? "");
+      if (inst.instance?.compartmentId) compartmentId = inst.instance.compartmentId;
+    } catch {
+    }
+    const res = await clients.compute.listInstanceConsoleConnections({ compartmentId, instanceId });
+    const items = (res.items ?? []).filter((x) => !!x.id).map((x) => ({
+      id: x.id,
+      state: String(x.lifecycleState ?? ""),
+      fingerprint: (x.fingerprint ?? "").replace("SHA256:", "").slice(0, 24),
+      hasConnectionString: !!x.vncConnectionString,
+      // SDK 的类型定义里没有 timeCreated，但接口实际会返回（用于判断哪条是旧的）
+      timeCreated: x.timeCreated ?? null
+    })).sort((a, b) => (a.state === "DELETED" ? 1 : 0) - (b.state === "DELETED" ? 1 : 0));
+    return c.json({ items, compartmentId, instanceState });
+  } catch (e) {
+    return Response.json({ error: errorMessage(e) }, { status: 400 });
+  }
+});
+app.delete("/api/vnc/console-connections/:connectionId", async (c) => {
+  const cfgId = (c.req.query("cfgId") ?? "").trim();
+  if (!cfgId) return badRequest("\u7F3A\u5C11\u914D\u7F6E ID");
+  const cfg = await getCfg2(c.env, cfgId);
+  if (!cfg) return badRequest("OCI \u914D\u7F6E\u4E0D\u5B58\u5728");
+  const region = (c.req.query("region") ?? "").trim() || void 0;
+  const compartment = (c.req.query("compartment") ?? "").trim() || void 0;
+  try {
+    const clients = await clientsFor(c.env, cfg, region, compartment);
+    await clients.compute.deleteInstanceConsoleConnection({
+      instanceConsoleConnectionId: c.req.param("connectionId")
+    });
+    return c.json({ ok: true });
+  } catch (e) {
+    const raw2 = errorMessage(e);
+    if (/currently being modified/i.test(raw2)) {
+      return Response.json(
+        {
+          error: `OCI \u62D2\u7EDD\u4E86\u5220\u9664\u8BF7\u6C42\uFF08\u5B9E\u4F8B\u72B6\u6001\u9501\u672A\u91CA\u653E\uFF09\u3002\u8FD9\u901A\u5E38\u8BF4\u660E\u5B9E\u4F8B\u4E0A\u6709\u4E00\u4E2A\u6302\u8D77\u7684\u53D8\u66F4\u64CD\u4F5C\uFF0C\u9700\u8981\u7B49\u5B83\u7ED3\u675F\u6216\u91CD\u542F\u5B9E\u4F8B\u3002
+OCI \u539F\u59CB\u54CD\u5E94\uFF1A${raw2}`,
+          detail: raw2
+        },
+        { status: 409 }
+      );
+    }
+    return Response.json({ error: raw2 }, { status: 400 });
   }
 });
 app.get("/api/vnc/ws", async (c) => {
@@ -203728,14 +203905,13 @@ app.get("/api/vnc/ws", async (c) => {
   const stub = c.env.VNC_TUNNEL.get(c.env.VNC_TUNNEL.idFromName(sessionId));
   return stub.fetch(c.req.raw);
 });
-async function cleanupExpiredVncSessions(env, clients, cfg) {
-  const now = Date.now();
+async function cleanupExpiredVncSessions(env, _clients, _cfg) {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1e3;
   const rows = await env.DB.prepare("SELECT key, value FROM sys_cfg WHERE key LIKE ?").bind(VNC_SESSION_PREFIX2 + "%").all();
   for (const row of rows.results ?? []) {
     try {
       const session = JSON.parse(await decryptText(keySecretsForRead(env), row.value));
-      if (session.expiresAt <= now) {
-        await deleteConsoleConnection(clients, session.connectionId);
+      if (session.expiresAt <= cutoff) {
         await env.DB.prepare("DELETE FROM sys_cfg WHERE key = ?").bind(row.key).run();
       }
     } catch {
@@ -205244,29 +205420,18 @@ app.onError((err, c) => {
 });
 async function cleanupTempData(env) {
   const now = Date.now();
-  const graceMs = 5 * 60 * 1e3;
+  const keepMs = 7 * 24 * 60 * 60 * 1e3;
   try {
     const rows = await env.DB.prepare("SELECT key, value FROM sys_cfg WHERE key LIKE ?").bind(VNC_SESSION_PREFIX2 + "%").all();
     for (const row of rows.results ?? []) {
-      let session = null;
       let shouldRemove = false;
       try {
-        session = JSON.parse(await decryptText(keySecretsForRead(env), row.value));
-        shouldRemove = session.expiresAt + graceMs <= now;
+        const session = JSON.parse(await decryptText(keySecretsForRead(env), row.value));
+        shouldRemove = session.expiresAt + keepMs <= now;
       } catch {
         shouldRemove = true;
       }
       if (!shouldRemove) continue;
-      if (session?.connectionId && session?.cfgId) {
-        try {
-          const cfg = await getCfg2(env, session.cfgId);
-          if (cfg) {
-            const clients = await clientsFor(env, cfg, session.region || cfg.region);
-            await deleteConsoleConnection(clients, session.connectionId);
-          }
-        } catch {
-        }
-      }
       await env.DB.prepare("DELETE FROM sys_cfg WHERE key = ?").bind(row.key).run();
     }
   } catch {
