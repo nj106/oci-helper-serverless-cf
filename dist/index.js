@@ -21098,7 +21098,7 @@ var require_url = __commonJS({
 // node_modules/unenv/dist/runtime/npm/node-fetch.mjs
 var node_fetch_exports = {};
 __export(node_fetch_exports, {
-  AbortController: () => AbortController,
+  AbortController: () => AbortController2,
   AbortError: () => AbortError,
   FetchError: () => FetchError,
   Headers: () => Headers2,
@@ -21108,14 +21108,14 @@ __export(node_fetch_exports, {
   fetch: () => fetch2,
   isRedirect: () => isRedirect
 });
-var fetch2, Headers2, Request2, Response2, AbortController, FetchError, AbortError, redirectStatus, isRedirect, node_fetch_default;
+var fetch2, Headers2, Request2, Response2, AbortController2, FetchError, AbortError, redirectStatus, isRedirect, node_fetch_default;
 var init_node_fetch = __esm({
   "node_modules/unenv/dist/runtime/npm/node-fetch.mjs"() {
     fetch2 = /* @__PURE__ */ __name((...args) => globalThis.fetch(...args), "fetch");
     Headers2 = globalThis.Headers;
     Request2 = globalThis.Request;
     Response2 = globalThis.Response;
-    AbortController = globalThis.AbortController;
+    AbortController2 = globalThis.AbortController;
     FetchError = Error;
     AbortError = Error;
     redirectStatus = /* @__PURE__ */ new Set([
@@ -203090,6 +203090,41 @@ async function runDueIpTasks(env) {
 }
 __name(runDueIpTasks, "runDueIpTasks");
 
+// src/update-check.ts
+var DEV_BUILD_ID = "dev";
+var REPO = "Yohann0617/oci-helper-serverless-cf";
+var REPO_URL = `https://github.com/${REPO}`;
+var VERSION_URL = `https://raw.githubusercontent.com/${REPO}/main/version.json`;
+function currentBuildId() {
+  return "20261125.215050" ? "20261125.215050" : DEV_BUILD_ID;
+}
+__name(currentBuildId, "currentBuildId");
+async function checkUpdate() {
+  const current = currentBuildId();
+  const base = { current, latest: null, hasUpdate: false, repo: REPO_URL };
+  if (current === DEV_BUILD_ID) return base;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5e3);
+  try {
+    const res = await fetch(VERSION_URL, {
+      signal: controller.signal,
+      // 所有用户共享边缘缓存，避免 raw.githubusercontent 被反复回源
+      cf: { cacheTtl: 1800, cacheEverything: true },
+      headers: { "user-agent": `oci-helper-serverless/${current}` }
+    });
+    if (!res.ok) return base;
+    const data = await res.json();
+    const latest = typeof data?.version === "string" ? data.version.trim() : "";
+    if (!latest) return base;
+    return { current, latest, hasUpdate: latest > current, repo: REPO_URL };
+  } catch {
+    return base;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+__name(checkUpdate, "checkUpdate");
+
 // src/log-hub.ts
 var MAX_BUFFER = 300;
 var LogHub = class {
@@ -203929,6 +203964,7 @@ app.get(
     defaultRegion: c.env.DEFAULT_REGION || "ap-singapore-1"
   })
 );
+app.get("/api/update-check", async (c) => c.json(await checkUpdate()));
 app.get("/api/regions", (c) => c.json({ items: allRegions() }));
 app.get("/api/random-password", (c) => c.json({ password: randomPassword(16) }));
 app.get("/api/sys", async (c) => {

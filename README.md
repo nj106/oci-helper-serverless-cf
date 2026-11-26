@@ -1,4 +1,5 @@
-# OCI Helper Serverless（一键部署版）
+# OCI Helper Serverless（部署到 Cloudflare Workers）
+> 原项目：https://github.com/Yohann0617/oci-helper
 
 一键把 **OCI 抢机 / 实例管理面板**部署到你自己的 Cloudflare 账号。
 
@@ -6,37 +7,45 @@
 
 ## 特点
 
+- **一键部署**：Deploy 按钮会自动 Fork 仓库，向导里点一下“新建数据库”即可创建 D1，无需提前去控制台建库。
 - 数据库表结构由 Worker 在**首次请求时自动创建**，无需执行任何 SQL 命令。
-- 提供两种部署方式，按需选择：
-  - **方式一 · 一键按钮（推荐）**：自动 Fork + 创建 D1 + 部署，全程不用手动建库。
-  - **方式二 · 连接 GitHub 导入（不 Fork）**：不创建副本仓库，但需要先手动建 D1 再绑定（多 3 步）。
+- 只需要一个 Worker + 一个 D1 数据库，部署后即可通过浏览器使用。
 
-## 方式一：一键按钮部署（自动创建 D1）（推荐🏆）
+## 部署前必读
 
-1. 点击页面顶部的 **Deploy to Cloudflare** 按钮。
-2. 授权 GitHub / Cloudflare，Cloudflare 会把本仓库**复制一份到你自己的 GitHub 账号**，并自动创建 D1 数据库（如未创建，参考下方方式二创建并绑定）、绑定资源、完成部署（按向导提示填写 Worker 名称即可，默认 `oci-helper-serverless`）。
-3. 部署完成后，先在 Worker → **设置 → 变量与 Secrets** 设置 `AUTH_PASSWORD`、 `AUTH_SECRET` 和 `KEY_SECRET`（见下方“部署后必做”），再打开 Worker 域名（如 `https://oci-helper-serverless.<你的子域>.workers.dev`）登录。
+- 点击 Deploy 按钮后，Cloudflare 会把本仓库**复制一份到你自己的 GitHub 账号**（Fork，无法关闭），随后在该副本上完成构建和部署。
+- 部署向导会要求你在 D1 绑定那一栏点“新建数据库”并填一个名称（例如 `oci-helper-serverless`）。确认后 Cloudflare 会自动创建该库，并把真实的 `database_id` 写回你账号下的仓库副本，不需要提前去控制台建库。
+- 如果向导里没出现 D1 这一项、或部署报 `database_id` 相关错误，直接看下方「方式二」手动补一个库即可，不影响使用。
 
-> 这个方式会 Fork 仓库到你的账号（Cloudflare 的机制如此，无法关闭），好处是以后可以在你 Fork 的仓库点 **Sync fork** 同步源仓库更新，Cloudflare 会自动重新部署。
+## 方式一：Deploy 按钮（自动 Fork + 向导新建 D1）（推荐🏆）
 
-## 方式二：连接 GitHub 导入（不 Fork，需手动建 D1）
+1. 点击页面顶部的 **Deploy to Cloudflare** 按钮，分别授权 GitHub 和 Cloudflare。
+2. 向导会列出要创建的资源：Worker 名称默认 `oci-helper-serverless`（可改）；D1 绑定为 `DB`，在它那一项点 **新建数据库 / Create new**，名称填 `oci-helper-serverless`（可自定义，仅作标识）。向导会自动创建数据库并把 `database_id` 注入你账号下的仓库副本，全程不用离开向导。
+3. 点击部署，等待构建完成。
+4. 部署完成后，去 Worker → **设置 → 变量与 Secrets** 添加 `AUTH_PASSWORD`、`AUTH_SECRET`、`KEY_SECRET`（见下方「部署后必做」）。
+5. 打开 Worker 域名（如 `https://oci-helper-serverless.<你的子域>.workers.dev`）登录，首次请求会自动建表。
+
+> 以后更新：到你 Fork 的仓库点 **Sync fork → Update branch**，Cloudflare 会自动重新部署。
+
+## 方式二：Fork + 手动创建 D1 + 连接 GitHub（可选）
 
 <details>
     <summary> ☜ Read more 👨‍💻</summary>
-  
-如果你不想 Fork、想直接连接本仓库导入，按下面步骤操作：
 
-1. **先创建 D1 数据库**：Cloudflare Dashboard → **存储和数据库 → D1 SQL 数据库 → 创建**，名称随便填（例如 `oci-helper-db`，只是给你自己看的标签），创建即可。
-2. **导入项目**：Workers & Pages → **创建 → 连接 GitHub**，选择本仓库（`oci-helper-serverless-cf`），在构建设置里把**部署命令**改为：
-   ```
-   npx wrangler deploy --config wrangler.import.toml
-   ```
-   （`wrangler.import.toml` 是专门为不 Fork 方式准备的配置，不声明 D1，因此不会因占位符 `database_id` 而部署失败。）
-3. **绑定 D1**：部署完成后，进入该 Worker → **设置 → 绑定 → 添加绑定**，类型选 **D1 数据库**，**变量名称必须填 `DB`**（大小写一致），选择第 1 步创建的数据库，保存。
-4. **重新部署**：在 Worker 的 **部署** 页点一次重新部署，让绑定生效。Worker 首次请求时会自动建表，无需执行任何 SQL 命令。
-5. 设置 `AUTH_PASSWORD` 和 `KEY_SECRET` 后打开 Worker 域名登录；未设置 `AUTH_PASSWORD` 时请查看 Worker 日志中的随机初始密码。
+适用于向导里没有新建数据库、或者你想自己控制数据库的情况：
 
-> 为何方式二不能自动建库：Cloudflare 的"连接 GitHub 导入仓库"流程不会读取占位符自动创建 D1，只有 Deploy 按钮的向导才会。因此这里用 `wrangler.import.toml` 跳过 D1 声明，再在 Dashboard 里手动绑定（变量名 `DB`）。数据库名称本身随便，Worker 只认绑定变量名 `DB`。
+1. **Fork 仓库**：打开 https://github.com/Yohann0617/oci-helper-serverless-cf ，点右上角 **Fork → Create fork**。
+2. **创建 D1 数据库**：Cloudflare Dashboard → **存储和数据库 → D1 SQL 数据库 → 创建**，名称填 `oci-helper-serverless`（可自定义，仅作标识），创建后复制页面上的 **Database ID**。
+3. **填写 database_id**：在你 Fork 的仓库里编辑 `wrangler.toml`，把占位符换成第 2 步拿到的 ID，然后提交：
+   ```toml
+   [[d1_databases]]
+   binding = "DB"
+   database_name = "oci-helper-serverless"   # 与第 2 步创建的库名一致即可
+   database_id = "粘贴第 2 步的 Database ID"
+   migrations_dir = "migrations"
+   ```
+4. **连接 GitHub 部署**：Workers & Pages → **创建 → 连接 GitHub**，授权后选择**你自己的 Fork**。构建设置保持默认即可（构建命令留空，部署命令为 `npx wrangler deploy` 或 `npm run deploy`），保存并部署。
+5. **设置变量并登录**：添加 `AUTH_PASSWORD`、`AUTH_SECRET`、`KEY_SECRET` 后打开 Worker 域名登录。
 
 </details>
 
@@ -44,7 +53,7 @@
 
 <details>
     <summary> ☜ Read more 👨‍💻</summary>
-  
+
 如果你想在自己机器上部署：
 
 ```bash
@@ -69,8 +78,17 @@ wrangler deploy
 
 > 提示：本项目没有默认口令。若未设置 `AUTH_PASSWORD`，请从 Worker 日志获取随机初始密码并尽快改为自己的密码。
 
-<img width="934" height="442" alt="image" src="https://github.com/user-attachments/assets/a9decfd4-fee5-4b8d-a1f6-2d50507f6510" />
+<img width="898" height="555" alt="image" src="https://github.com/user-attachments/assets/9d4a62fd-55be-402d-bb38-b336ac8831a7" />
 
+## 常见问题
+
+- **部署向导里没看到 D1 / 没点“新建数据库”就继续了**：按「方式二」手动创建一个库，把 ID 填进你 Fork 仓库的 `wrangler.toml` 后重新部署。
+- **构建报 `binding DB of type d1 must have a valid database_id`**：`wrangler.toml` 里还是占位符，按方式二第 3 步填入真实 ID。
+- **部署成功但页面报错 / 提示数据库未初始化**：Worker 没有名为 `DB` 的 D1 绑定。请确认仓库 `wrangler.toml` 里的 `database_id` 已填真实 ID 后重新部署（在 Dashboard 手动加的绑定会在每次部署时被配置覆盖）。
+- **之前把部署命令改成过 `--config wrangler.import.toml`**：该方式已移除，请改回 `npx wrangler deploy`，并在 `wrangler.toml` 里填好 `database_id`，否则每次部署都会丢掉 D1 绑定。
+- **打不开登录页但不知道密码**：未设置 `AUTH_PASSWORD` 时到 Worker 实时日志查看随机初始密码，或直接设置该变量。
+- **改了 `KEY_SECRET` 后原有 OCI 配置报解密失败**：这是预期行为，加密密钥已变，需重新录入私钥等敏感信息。
+- **报 `Cannot apply new-sqlite-class migration ...` (10074)**：说明你的 Worker 里已有早期的 Durable Object 命名空间。本仓库配置已改用声明式 `exports`，正常情况下不会触发；若仍出现，请用最新仓库重新同步部署，或删除旧 Worker 后重建（D1 数据不受影响，`KEY_SECRET` 需沿用）。
 
 ## 需要哪些API权限
 在 OCI 控制台创建一个 IAM 用户 + API Key，把 user OCID / tenancy OCID / fingerprint / 私钥填到系统设置。建议给该用户单独的组，策略最小化，例如：
@@ -87,8 +105,11 @@ Allow group <你的组> to inspect limits in tenancy
 
 ## 后续更新
 
-- **方式一（Fork 用户）**：在你 Fork 的仓库页面点 **Sync fork → Update branch**，Cloudflare 会自动重新部署；如未自动触发，在 Cloudflare Dashboard 手动点 **Deploy**，或重新打开部署按钮向导选择已有仓库。
-- **方式二（直接导入用户）**：本仓库更新后，因 Cloudflare 已连接该 GitHub 仓库，通常会自动构建；若没有，在 Worker 的 **部署** 页点 **Deploy** 触发一次即可。
+所有部署方式都基于**你 Fork 的仓库**，更新流程一致：
+
+1. 在你 Fork 的仓库页面点 **Sync fork → Update branch**。
+2. Cloudflare 会自动重新构建部署；若没有自动触发，就到 Worker 的「部署」页点一次 **Deploy**。
+3. 若同步时 `wrangler.toml` 出现冲突，**保留你自己填的 `database_id`**，只合并源仓库的其他改动。
 
 ## 隐私与数据
 
