@@ -31,7 +31,8 @@ jobs:
           node-version: 22
       - name: Patch wrangler.toml (D1 id + custom domain)
         run: |
-          sed -i "s/REPLACE_WITH_YOUR_D1_DATABASE_ID/${D1_DATABASE_ID}/" wrangler.toml
+          # 上游已把占位符换成自己的真实 database_id，改按行整体覆盖，不再依赖占位符
+          sed -i -E "s/^database_id = \".*\"/database_id = \"${D1_DATABASE_ID}\"/" wrangler.toml
           grep -q "custom_domain" wrangler.toml || \
             sed -i "0,/^compatibility_flags.*/s//&\nroutes = [{ pattern = \"${CUSTOM_DOMAIN}\", custom_domain = true }]/" wrangler.toml
           grep -q "${D1_DATABASE_ID}" wrangler.toml
